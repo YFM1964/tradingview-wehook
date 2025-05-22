@@ -3,7 +3,7 @@ services:
     name: tradingview-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn integrated_tradingview_bot:bot.app
+    startCommand: gunicorn app:app
     plan: free
     envVars:
       - key: DEMO_MODE
