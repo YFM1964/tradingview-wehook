@@ -1,7 +1,16 @@
 services:
   - type: web
-    name: tradingview-webhook
+    name: tradingview-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn webhook_server:app
+    startCommand: gunicorn integrated_tradingview_bot:bot.app
     plan: free
+    envVars:
+      - key: DEMO_MODE
+        value: "True"
+      - key: SYMBOL
+        value: "XRP/USDT"
+      - key: FIXED_AMOUNT
+        value: "1000"
+      - key: WEBHOOK_PORT
+        value: "5000"
