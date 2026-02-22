@@ -51,6 +51,14 @@ DYNAMIC_CONFIG_DEFAULTS = {
     'RSI_MOMENTUM_LOOKBACK': 4,
     'MIN_PRICE_DIFF': 0.02,
 
+    # Position sizing
+    'POSITION_SIZING_MODE': 'percent_cycle_base',  # 'percent_cycle_base' or 'fixed_usdt'
+    'POSITION_SIZE_PERCENT': 100.0,  # Per-entry size from cycle base (100 = all-in single entry)
+    'POSITION_SIZE_USDT': 100.0,     # Used when POSITION_SIZING_MODE = 'fixed_usdt'
+    'POSITION_ALLOW_SCALE_IN': True,
+    'POSITION_MAX_ENTRIES': 10,
+    'MIN_ORDER_USDT': 10.0,
+
     # Network / Retry settings
     'NETWORK_TIMEOUT_MS': 20000,
     'NETWORK_MAX_RETRIES': 3,
@@ -129,8 +137,12 @@ class RSISpotBot:
         self.starting_balance_usdt = self.balance_usdt
         self.starting_balance_coin = self.balance_coin
         
-        self.current_position = None  # {'side': 'BUY', 'entry_price': 2.0, 'amount': 500}
+        self.current_position = None  # {'side': 'BUY', 'entry_price': 2.0, 'amount': 500, 'invested_usdt': 1000, 'entries': 1}
         self.total_pnl = 0.0
+
+        # Cycle-based position sizing state
+        self.cycle_base_balance_usdt = None
+        self.cycle_invested_usdt = 0.0
         
         # Trailing Stop tracking
         self.highest_price_since_entry = None
@@ -193,6 +205,16 @@ class RSISpotBot:
             cfg['RSI_MOMENTUM_LOOKBACK'] = 4
 
         cfg['MIN_PRICE_DIFF'] = max(0.0, self._safe_float(cfg.get('MIN_PRICE_DIFF'), 0.02))
+
+        sizing_mode = str(cfg.get('POSITION_SIZING_MODE', 'percent_cycle_base')).lower()
+        if sizing_mode not in ('percent_cycle_base', 'fixed_usdt'):
+            sizing_mode = 'percent_cycle_base'
+        cfg['POSITION_SIZING_MODE'] = sizing_mode
+        cfg['POSITION_SIZE_PERCENT'] = min(100.0, max(0.1, self._safe_float(cfg.get('POSITION_SIZE_PERCENT'), 100.0)))
+        cfg['POSITION_SIZE_USDT'] = max(0.1, self._safe_float(cfg.get('POSITION_SIZE_USDT'), 100.0))
+        cfg['POSITION_ALLOW_SCALE_IN'] = self._safe_bool(cfg.get('POSITION_ALLOW_SCALE_IN', True), True)
+        cfg['POSITION_MAX_ENTRIES'] = max(1, self._safe_int(cfg.get('POSITION_MAX_ENTRIES'), 10))
+        cfg['MIN_ORDER_USDT'] = max(0.0, self._safe_float(cfg.get('MIN_ORDER_USDT'), 10.0))
 
         cfg['NETWORK_TIMEOUT_MS'] = max(5000, self._safe_int(cfg.get('NETWORK_TIMEOUT_MS'), 20000))
         cfg['NETWORK_MAX_RETRIES'] = max(1, self._safe_int(cfg.get('NETWORK_MAX_RETRIES'), 3))
@@ -312,6 +334,20 @@ class RSISpotBot:
         print(f'Check Interval: {self.config["CHECK_INTERVAL_SECONDS"]} seconds')
         print(f'RSI Period: {self.config["RSI_PERIOD"]} | Min Change: {self.dynamic_config["RSI_MOMENTUM_MIN_CHANGE"]}')
         print(f'RSI Momentum Lookback: {self.dynamic_config["RSI_MOMENTUM_LOOKBACK"]} points')
+
+        # Position sizing
+        sizing_mode = self.dynamic_config.get('POSITION_SIZING_MODE', 'percent_cycle_base')
+        if sizing_mode == 'fixed_usdt':
+            print(f'Position Sizing: FIXED {self.dynamic_config["POSITION_SIZE_USDT"]:.2f} USDT per entry')
+        else:
+            print(f'Position Sizing: {self.dynamic_config["POSITION_SIZE_PERCENT"]:.2f}% of cycle base per entry')
+            print('  Cycle base means entry size stays fixed per cycle (no half-of-half staircase)')
+        configured_max_entries = self.dynamic_config.get('POSITION_MAX_ENTRIES', 10)
+        print(
+            f'Scale-in: {"ENABLED" if self.dynamic_config["POSITION_ALLOW_SCALE_IN"] else "DISABLED"} '
+            f'| Max Entries (configured/effective): {configured_max_entries}/{self._get_effective_max_entries()}'
+        )
+        print(f'Min Order: {self.dynamic_config["MIN_ORDER_USDT"]:.2f} USDT')
         
         # RSI Zones
         if self.dynamic_config['USE_RSI_ZONES']:
@@ -590,60 +626,141 @@ class RSISpotBot:
         """Calculate unrealized PNL for current position"""
         if not self.current_position:
             return 0.0, 0.0
-        
-        entry_price = self.current_position['entry_price']
+
         amount = self.current_position['amount']
-        
-        # BUY position: holding coin
-        pnl_usdt = (current_price - entry_price) * amount
-        pnl_pct = ((current_price - entry_price) / entry_price) * 100
-        
+        invested_usdt = self.current_position.get('invested_usdt', self.current_position['entry_price'] * amount)
+        market_value = current_price * amount
+
+        pnl_usdt = market_value - invested_usdt
+        pnl_pct = (pnl_usdt / invested_usdt) * 100 if invested_usdt > 0 else 0.0
+
         return pnl_usdt, pnl_pct
+
+    def _reset_cycle_tracking(self):
+        self.cycle_base_balance_usdt = None
+        self.cycle_invested_usdt = 0.0
+
+    def _get_effective_max_entries(self):
+        configured_max_entries = max(1, self.dynamic_config.get('POSITION_MAX_ENTRIES', 1))
+        sizing_mode = self.dynamic_config.get('POSITION_SIZING_MODE', 'percent_cycle_base')
+
+        if sizing_mode == 'percent_cycle_base':
+            percent = self.dynamic_config.get('POSITION_SIZE_PERCENT', 100.0)
+            if percent <= 0:
+                return 1
+            budget_limited_entries = max(1, int((100.0 + 1e-9) // percent))
+            return min(configured_max_entries, budget_limited_entries)
+
+        return configured_max_entries
+
+    def _calculate_buy_usdt(self):
+        """Calculate entry size in USDT using configured sizing rules."""
+        min_order_usdt = self.dynamic_config.get('MIN_ORDER_USDT', 10.0)
+        if self.balance_usdt <= 0:
+            return None, 'No USDT balance'
+
+        existing_entries = self.current_position.get('entries', 0) if self.current_position else 0
+        allow_scale_in = self.dynamic_config.get('POSITION_ALLOW_SCALE_IN', False)
+        if self.current_position and not allow_scale_in:
+            return None, 'Already holding coin - Scale-in disabled'
+
+        max_entries = self._get_effective_max_entries()
+        if existing_entries >= max_entries:
+            return None, f'Max entries reached ({max_entries})'
+
+        sizing_mode = self.dynamic_config.get('POSITION_SIZING_MODE', 'percent_cycle_base')
+
+        if sizing_mode == 'fixed_usdt':
+            target_entry_usdt = self.dynamic_config.get('POSITION_SIZE_USDT', 100.0)
+            usdt_to_use = min(target_entry_usdt, self.balance_usdt)
+        else:
+            if self.current_position is None:
+                # New cycle starts from current free USDT.
+                self.cycle_base_balance_usdt = self.balance_usdt
+                self.cycle_invested_usdt = 0.0
+            elif self.cycle_base_balance_usdt is None:
+                # Fallback for safety (e.g. runtime state inconsistency).
+                invested = self.current_position.get('invested_usdt', 0.0)
+                self.cycle_base_balance_usdt = self.balance_usdt + invested
+                self.cycle_invested_usdt = invested
+
+            percent = self.dynamic_config.get('POSITION_SIZE_PERCENT', 100.0)
+            target_entry_usdt = self.cycle_base_balance_usdt * (percent / 100.0)
+            remaining_cycle_budget = max(0.0, self.cycle_base_balance_usdt - self.cycle_invested_usdt)
+            usdt_to_use = min(target_entry_usdt, remaining_cycle_budget, self.balance_usdt)
+
+        if usdt_to_use <= 0:
+            return None, 'No available budget for new entry'
+        if usdt_to_use < min_order_usdt:
+            return None, f'Order size {usdt_to_use:.2f} < min order {min_order_usdt:.2f} USDT'
+
+        return usdt_to_use, None
     
     def buy_coin(self, current_price, reason):
         """Buy coin with available USDT"""
-        # If already holding coin, ignore
-        if self.current_position:
-            print('   Already holding coin - Signal ignored')
+        entry_usdt, sizing_error = self._calculate_buy_usdt()
+        if entry_usdt is None:
+            print(f'   {sizing_error} - Cannot buy')
             return
-        
-        # Check if have USDT
-        if self.balance_usdt <= 0:
-            print('   No USDT balance - Cannot buy')
-            return
-        
+
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Buy coin with all USDT
-        amount = self.balance_usdt / current_price
-        
-        self.current_position = {
-            'side': 'BUY',
-            'entry_price': current_price,
-            'amount': amount
-        }
-        
-        # Initialize trailing stop tracking
-        self.highest_price_since_entry = current_price
-        
+        amount = entry_usdt / current_price
+
+        if self.current_position:
+            old_amount = self.current_position['amount']
+            old_invested = self.current_position.get('invested_usdt', old_amount * self.current_position['entry_price'])
+            new_amount = old_amount + amount
+            new_invested = old_invested + entry_usdt
+
+            self.current_position['amount'] = new_amount
+            self.current_position['invested_usdt'] = new_invested
+            self.current_position['entry_price'] = new_invested / new_amount if new_amount > 0 else current_price
+            self.current_position['entries'] = self.current_position.get('entries', 1) + 1
+        else:
+            self.current_position = {
+                'side': 'BUY',
+                'entry_price': current_price,
+                'amount': amount,
+                'invested_usdt': entry_usdt,
+                'entries': 1
+            }
+
+        # Initialize/update trailing stop tracking
+        if self.highest_price_since_entry is None:
+            self.highest_price_since_entry = current_price
+        else:
+            self.highest_price_since_entry = max(self.highest_price_since_entry, current_price)
+
         # Update balances
-        self.balance_coin = amount
-        self.balance_usdt = 0.0
-        
+        self.balance_coin += amount
+        self.balance_usdt -= entry_usdt
+        if self.balance_usdt < 1e-10:
+            self.balance_usdt = 0.0
+        self.cycle_invested_usdt += entry_usdt
+
+        entries = self.current_position.get('entries', 1)
+        avg_entry = self.current_position.get('entry_price', current_price)
+
         # Record trade
         self.trades.append({
             'timestamp': timestamp,
             'type': 'BUY',
             'price': current_price,
             'amount': amount,
+            'order_usdt': entry_usdt,
+            'entry_number': entries,
+            'avg_entry_price': avg_entry,
             'reason': reason,
             'balance_usdt': self.balance_usdt,
             'balance_coin': self.balance_coin
         })
-        
+
         print(f'\n{timestamp} | ━━━ BUY {self.base_currency} ━━━')
         print(f'   Price: {current_price:.4f}')
-        print(f'   Amount: {amount:.2f} {self.base_currency}')
+        print(f'   Amount: {amount:.2f} {self.base_currency} | Used: {entry_usdt:.2f} USDT')
+        print(f'   Avg Entry: {avg_entry:.4f} | Entries: {entries}/{self._get_effective_max_entries()}')
+        if self.dynamic_config.get('POSITION_SIZING_MODE') == 'percent_cycle_base' and self.cycle_base_balance_usdt:
+            print(f'   Cycle Base: {self.cycle_base_balance_usdt:.2f} USDT | Invested: {self.cycle_invested_usdt:.2f} USDT')
         print(f'   Reason: {reason}')
         print(f'   Balance: {self.balance_usdt:.2f} USDT + {self.balance_coin:.2f} {self.base_currency}')
     
@@ -654,26 +771,30 @@ class RSISpotBot:
             print('   No coin to sell - Signal ignored')
             return
         
-        # Check if have coin
-        if self.balance_coin <= 0:
+        amount_in_position = self.current_position.get('amount', 0.0)
+
+        # Check if have coin in tracked position
+        if amount_in_position <= 0:
             print('   No coin balance - Cannot sell')
             return
         
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         entry_price = self.current_position['entry_price']
-        amount = self.current_position['amount']
-        
+        amount = amount_in_position
+        invested_usdt = self.current_position.get('invested_usdt', entry_price * amount)
+        entries = self.current_position.get('entries', 1)
+
         # Calculate PNL
-        pnl_usdt = (current_price - entry_price) * amount
-        pnl_pct = ((current_price - entry_price) / entry_price) * 100
-        
-        # Sell coin for USDT
         usdt_received = amount * current_price
-        
-        # Update balances
-        self.balance_usdt = usdt_received
-        self.balance_coin = 0.0
+        pnl_usdt = usdt_received - invested_usdt
+        pnl_pct = (pnl_usdt / invested_usdt) * 100 if invested_usdt > 0 else 0.0
+
+        # Update balances (keep unused USDT that remained outside the position)
+        self.balance_usdt += usdt_received
+        self.balance_coin = max(0.0, self.balance_coin - amount)
+        if self.balance_coin < 1e-10:
+            self.balance_coin = 0.0
         self.total_pnl += pnl_usdt
         
         # Clear position
@@ -681,6 +802,7 @@ class RSISpotBot:
         
         # Reset trailing stop tracking
         self.highest_price_since_entry = None
+        self._reset_cycle_tracking()
         
         # Record trade
         self.trades.append({
@@ -689,6 +811,8 @@ class RSISpotBot:
             'entry_price': entry_price,
             'exit_price': current_price,
             'amount': amount,
+            'invested_usdt': invested_usdt,
+            'entries': entries,
             'pnl_usdt': pnl_usdt,
             'pnl_pct': pnl_pct,
             'reason': reason,
@@ -699,6 +823,7 @@ class RSISpotBot:
         print(f'\n{timestamp} | ━━━ SELL {self.base_currency} ━━━')
         print(f'   Entry: {entry_price:.4f} → Exit: {current_price:.4f}')
         print(f'   Amount: {amount:.2f} {self.base_currency}')
+        print(f'   Entries Closed: {entries} | Invested: {invested_usdt:.2f} USDT')
         print(f'   PNL: {pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%)')
         print(f'   Reason: {reason}')
         print(f'   Balance: {self.balance_usdt:.2f} USDT (Total PNL: {self.total_pnl:+.2f} USDT)')
@@ -884,7 +1009,17 @@ class RSISpotBot:
                     # Position status
                     if self.current_position:
                         unrealized_pnl, unrealized_pnl_pct = self.get_unrealized_pnl(current_price)
-                        pos_status = f'Position: HOLDING {self.balance_coin:.2f} {self.base_currency} @ {self.current_position["entry_price"]:.4f} | PNL: {unrealized_pnl:+.2f} USDT ({unrealized_pnl_pct:+.2f}%)'
+                        position_amount = self.current_position.get('amount', self.balance_coin)
+                        position_entries = self.current_position.get('entries', 1)
+                        invested_usdt = self.current_position.get(
+                            'invested_usdt',
+                            self.current_position.get('entry_price', current_price) * position_amount
+                        )
+                        pos_status = (
+                            f'Position: HOLDING {position_amount:.2f} {self.base_currency} '
+                            f'@ {self.current_position["entry_price"]:.4f} | Entries: {position_entries} '
+                            f'| Invested: {invested_usdt:.2f} USDT | PNL: {unrealized_pnl:+.2f} USDT ({unrealized_pnl_pct:+.2f}%)'
+                        )
                         
                         # Trailing Stop status
                         trailing_stop_status = None
